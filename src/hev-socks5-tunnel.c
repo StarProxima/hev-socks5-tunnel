@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <hev-sys.h>
 
 #ifdef __GLIBC__
@@ -55,13 +56,22 @@ enum
     SYNC_STOP = 1 << 3,
 };
 
+enum
+{
+    SESSION_UDP,
+    SESSION_TCP,
+    SESSION_TYPES,
+};
+
 static int run;
 static atomic_int tsync;
 
 static int tun_fd = -1;
 static int tun_fd_local;
 static int session_count;
+static int session_type_count[SESSION_TYPES];
 static int evicted_count;
+static int session_track;
 static int event_fds[2] = { -1, -1 };
 
 static size_t stat_tx_packets;
@@ -77,7 +87,7 @@ static HevTaskMutex mutex;
 static HevTask *task_event;
 static HevTask *task_lwip_io;
 static HevTask *task_lwip_timer;
-static HevList session_set;
+static HevList session_set[SESSION_TYPES];
 
 static int
 task_io_yielder (HevTaskYieldType type, void *data)
@@ -132,6 +142,19 @@ netif_init_handler (struct netif *netif)
     return ERR_OK;
 }
 
+static int64_t
+hev_socks5_tunnel_now (void)
+{
+#ifdef _WIN32
+    return GetTickCount64 ();
+#else
+    struct timespec ts;
+
+    clock_gettime (CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
 static inline void
 hev_socks5_tunnel_mark_evicted (HevListNode *node)
 {
@@ -157,55 +180,136 @@ hev_socks5_tunnel_evict_session (HevListNode *node)
     HevSocks5SessionData *sd;
 
     sd = container_of (node, HevSocks5SessionData, node);
-    hev_list_del (&session_set, node);
+    hev_list_del (&session_set[sd->type], node);
     hev_socks5_tunnel_mark_evicted (node);
     session_count--;
+    session_type_count[sd->type]--;
     evicted_count++;
     hev_socks5_session_terminate (sd->self);
 }
 
-static void
-hev_socks5_tunnel_insert_session (HevListNode *node)
+static HevListNode *
+hev_socks5_tunnel_oldest_session (void)
 {
+    HevSocks5SessionData *u, *t;
+    HevListNode *udp, *tcp;
+
+    udp = hev_list_first (&session_set[SESSION_UDP]);
+    tcp = hev_list_first (&session_set[SESSION_TCP]);
+    if (!udp || !tcp)
+        return udp ? udp : tcp;
+
+    u = container_of (udp, HevSocks5SessionData, node);
+    t = container_of (tcp, HevSocks5SessionData, node);
+
+    return (u->active_time <= t->active_time) ? udp : tcp;
+}
+
+/*
+ * At the per-type limit only a session that has been silent for evict-min-idle
+ * is replaced, so a storm of new flows cannot kill live connections. A UDP
+ * session that got a reply and lived protect-age is replaced only after
+ * protect-idle of silence, so a flow with periodic keep-alives survives too.
+ */
+static int
+hev_socks5_tunnel_admit_session (int type)
+{
+    int cap, min_idle, protect_age, protect_idle;
+    HevListNode *node;
+    int64_t now;
+
+    if (type == SESSION_UDP) {
+        cap = hev_config_get_misc_udp_max_session_count ();
+        min_idle = hev_config_get_misc_udp_evict_min_idle ();
+        protect_age = hev_config_get_misc_udp_evict_protect_age ();
+        protect_idle = hev_config_get_misc_udp_evict_protect_idle ();
+    } else {
+        cap = hev_config_get_misc_tcp_max_session_count ();
+        min_idle = hev_config_get_misc_tcp_evict_min_idle ();
+        protect_age = 0;
+        protect_idle = 0;
+    }
+
+    if (!cap || session_type_count[type] < cap)
+        return 0;
+
+    now = hev_socks5_tunnel_now ();
+    node = hev_list_first (&session_set[type]);
+    for (; node; node = hev_list_node_next (node)) {
+        HevSocks5SessionData *sd;
+
+        sd = container_of (node, HevSocks5SessionData, node);
+        if (now - sd->active_time < min_idle)
+            break;
+        if (protect_age && sd->answered &&
+            (now - sd->create_time >= protect_age) &&
+            (now - sd->active_time < protect_idle))
+            continue;
+
+        hev_socks5_tunnel_evict_session (node);
+        return 0;
+    }
+
+    LOG_D ("socks5 tunnel %s session refused",
+           (type == SESSION_TCP) ? "tcp" : "udp");
+    return -1;
+}
+
+static void
+hev_socks5_tunnel_insert_session (HevListNode *node, int type)
+{
+    HevSocks5SessionData *sd;
     int max_session_count;
 
-    hev_list_add_tail (&session_set, node);
+    sd = container_of (node, HevSocks5SessionData, node);
+    sd->create_time = session_track ? hev_socks5_tunnel_now () : 0;
+    sd->active_time = sd->create_time;
+    sd->type = type;
+    sd->answered = 0;
+
+    hev_list_add_tail (&session_set[type], node);
     session_count++;
+    session_type_count[type]++;
 
     max_session_count = hev_config_get_misc_max_session_count ();
     if (!max_session_count)
         return;
 
     while (session_count >= max_session_count)
-        hev_socks5_tunnel_evict_session (hev_list_first (&session_set));
+        hev_socks5_tunnel_evict_session (hev_socks5_tunnel_oldest_session ());
 }
 
 static void
 hev_socks5_tunnel_delete_session (HevListNode *node)
 {
+    HevSocks5SessionData *sd;
+
     if (hev_socks5_tunnel_is_evicted (node)) {
         evicted_count--;
         return;
     }
 
-    hev_list_del (&session_set, node);
+    sd = container_of (node, HevSocks5SessionData, node);
+    hev_list_del (&session_set[sd->type], node);
     session_count--;
+    session_type_count[sd->type]--;
 }
 
 void
 hev_socks5_tunnel_update_session (HevListNode *node)
 {
-    int max_session_count;
+    HevSocks5SessionData *sd;
 
-    max_session_count = hev_config_get_misc_max_session_count ();
-    if (!max_session_count)
+    if (!session_track)
         return;
 
     if (hev_socks5_tunnel_is_evicted (node))
         return;
 
-    hev_list_del (&session_set, node);
-    hev_list_add_tail (&session_set, node);
+    sd = container_of (node, HevSocks5SessionData, node);
+    sd->active_time = hev_socks5_tunnel_now ();
+    hev_list_del (&session_set[sd->type], node);
+    hev_list_add_tail (&session_set[sd->type], node);
 }
 
 static void
@@ -259,6 +363,11 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
     if (!task)
         return ERR_MEM;
 
+    if (hev_socks5_tunnel_admit_session (SESSION_TCP) < 0) {
+        hev_task_unref (task);
+        return ERR_RST;
+    }
+
     tcp = hev_socks5_session_tcp_new (pcb, &mutex);
     if (!tcp) {
         hev_task_unref (task);
@@ -271,7 +380,7 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
-    hev_socks5_tunnel_insert_session (node);
+    hev_socks5_tunnel_insert_session (node, SESSION_TCP);
     hev_task_run (task, hev_socks5_session_task_entry, tcp);
     hev_task_wakeup (task_lwip_timer);
 
@@ -354,6 +463,12 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         return;
     }
 
+    if (hev_socks5_tunnel_admit_session (SESSION_UDP) < 0) {
+        hev_task_unref (task);
+        udp_recv (pcb, udp_drop_handler, NULL);
+        return;
+    }
+
     udp = hev_socks5_session_udp_new (pcb, &mutex);
     if (!udp) {
         hev_task_unref (task);
@@ -363,7 +478,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
-    hev_socks5_tunnel_insert_session (node);
+    hev_socks5_tunnel_insert_session (node, SESSION_UDP);
     hev_task_run (task, hev_socks5_session_task_entry, udp);
     hev_task_wakeup (task_lwip_timer);
 }
@@ -371,8 +486,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 static void
 event_task_entry (void *data)
 {
-    HevListNode *node;
-    int val;
+    int val, i;
 
     LOG_D ("socks5 tunnel event task run");
 
@@ -383,12 +497,16 @@ event_task_entry (void *data)
     WRITE_ONCE (run, 0);
     atomic_fetch_and (&tsync, ~SYNC_SENT);
 
-    node = hev_list_first (&session_set);
-    for (; node; node = hev_list_node_next (node)) {
-        HevSocks5SessionData *sd;
+    for (i = 0; i < SESSION_TYPES; i++) {
+        HevListNode *node;
 
-        sd = container_of (node, HevSocks5SessionData, node);
-        hev_socks5_session_terminate (sd->self);
+        node = hev_list_first (&session_set[i]);
+        for (; node; node = hev_list_node_next (node)) {
+            HevSocks5SessionData *sd;
+
+            sd = container_of (node, HevSocks5SessionData, node);
+            hev_socks5_session_terminate (sd->self);
+        }
     }
 
     hev_task_join (task_lwip_io);
@@ -489,7 +607,7 @@ lwip_timer_task_entry (void *data)
         }
         hev_task_mutex_unlock (&mutex);
 
-        if (hev_list_first (&session_set) || evicted_count)
+        if (session_count || evicted_count)
             hev_task_sleep (TCP_TMR_INTERVAL);
         else {
 #if defined(__GLIBC__) && !defined(ENABLE_LIBRARY)
@@ -806,6 +924,10 @@ hev_socks5_tunnel_init (int tun_fd)
     int res;
 
     LOG_D ("socks5 tunnel init");
+
+    session_track = hev_config_get_misc_max_session_count () ||
+                    hev_config_get_misc_udp_max_session_count () ||
+                    hev_config_get_misc_tcp_max_session_count ();
 
     res = tunnel_init (tun_fd);
     if (res < 0)
