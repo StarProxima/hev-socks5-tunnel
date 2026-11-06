@@ -194,6 +194,15 @@ socks5:
 # udp-queue-frames: 513
   # pending datagrams in all UDP sessions (0: unlimited)
 # udp-queue-total-frames: 0
+  # Queries to these resolvers (UDP port 53, comma separated IPv4 addresses
+  # or any) get a pool of their own outside the UDP limits, so names still
+  # resolve during a storm of new flows. A full pool closes a session that
+  # has its replies, a new query finds no room while all wait and takes the
+  # ordinary UDP path then. Pool size (0: off, up to 32) and the read-write
+  # timeout of its sessions (ms, 1000 - 10000)
+# dns-priority-sessions: 0
+# dns-priority-timeout: 5000
+# dns-priority-addresses: 1.1.1.1,1.0.0.1
   # connect timeout (ms)
 # connect-timeout: 10000
   # TCP read-write timeout (ms)

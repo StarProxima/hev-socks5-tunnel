@@ -32,6 +32,12 @@ struct _HevSocks5SessionData
     int64_t active_time;
     int type;
     int answered;
+    /* UDP: datagrams to the upstream not matched by a reply yet. */
+    int pending;
+    /* A query to a dns-priority resolver, in the pool or not. */
+    int lookup;
+    /* Replaces the UDP read-write timeout if > 0. */
+    int timeout;
 };
 
 struct _HevSocks5SessionIface

@@ -52,6 +52,10 @@ static int udp_evict_protect_age;
 static int udp_evict_protect_idle;
 static int udp_queue_frames;
 static int udp_queue_total_frames;
+static int dns_priority_sessions;
+static int dns_priority_timeout;
+static int dns_priority_address_count;
+static unsigned int dns_priority_addresses[DNS_PRIORITY_ADDRESSES];
 static int task_stack_size;
 static int wintun_ring_capacity;
 static int tcp_buffer_size;
@@ -388,6 +392,34 @@ hev_config_parse_log_level (const char *value)
     return HEV_LOGGER_WARN;
 }
 
+/* Comma separated IPv4 addresses, or "any" (no address, port 53 only). */
+static int
+hev_config_parse_dns_priority_addresses (const char *value)
+{
+    int n = 0;
+
+    if (0 == strcmp (value, "any"))
+        return 0;
+
+    for (value += strspn (value, ", "); *value; value += strspn (value, ", ")) {
+        size_t len = strcspn (value, ", ");
+        char buf[16];
+
+        if ((n == DNS_PRIORITY_ADDRESSES) || (len >= sizeof (buf)))
+            return -1;
+
+        memcpy (buf, value, len);
+        buf[len] = '\0';
+        if (inet_pton (AF_INET, buf, &dns_priority_addresses[n]) != 1)
+            return -1;
+
+        n++;
+        value += len;
+    }
+
+    return n ? n : -1;
+}
+
 static int
 hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
 {
@@ -445,6 +477,13 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
             udp_queue_frames = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "udp-queue-total-frames"))
             udp_queue_total_frames = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "dns-priority-sessions"))
+            dns_priority_sessions = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "dns-priority-timeout"))
+            dns_priority_timeout = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "dns-priority-addresses"))
+            dns_priority_address_count =
+                hev_config_parse_dns_priority_addresses (value);
         else if (0 == strcmp (key, "connect-timeout"))
             connect_timeout = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "read-write-timeout"))
@@ -465,6 +504,13 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
 
     if (udp_queue_frames <= 0)
         udp_queue_frames = UDP_POOL_SIZE + 1;
+    /* The pool bypasses the UDP limits, so it stays small. */
+    if (dns_priority_sessions &&
+        ((dns_priority_sessions > 32) || (dns_priority_address_count < 0) ||
+         (dns_priority_timeout < 1000) || (dns_priority_timeout > 10000))) {
+        LOG_E ("config misc dns-priority");
+        return -1;
+    }
     if (tcp_rw_timeout <= 0)
         tcp_rw_timeout = rw_timeout;
     if (udp_rw_timeout <= 0)
@@ -583,6 +629,9 @@ hev_config_reset (void)
     udp_evict_protect_idle = 0;
     udp_queue_frames = UDP_POOL_SIZE + 1;
     udp_queue_total_frames = 0;
+    dns_priority_sessions = 0;
+    dns_priority_timeout = 5000;
+    dns_priority_address_count = -1;
     task_stack_size = 86016;
     wintun_ring_capacity = 0x80000;
     tcp_buffer_size = 65536;
@@ -855,6 +904,25 @@ int
 hev_config_get_misc_udp_queue_total_frames (void)
 {
     return udp_queue_total_frames;
+}
+
+int
+hev_config_get_misc_dns_priority_sessions (void)
+{
+    return dns_priority_sessions;
+}
+
+int
+hev_config_get_misc_dns_priority_timeout (void)
+{
+    return dns_priority_timeout;
+}
+
+int
+hev_config_get_misc_dns_priority_addresses (const unsigned int **addresses)
+{
+    *addresses = dns_priority_addresses;
+    return dns_priority_address_count;
 }
 
 int

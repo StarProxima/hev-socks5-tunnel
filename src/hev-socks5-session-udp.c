@@ -259,6 +259,7 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, char *buf,
         }
 
         self->data.answered = 1;
+        self->data.pending -= (n < self->data.pending) ? n : self->data.pending;
     }
 
     return 1;
@@ -310,6 +311,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     }
 
     self->frames++;
+    self->data.pending++;
     queued_frames++;
     hev_list_add_tail (&self->frame_list, &frame->node);
     hev_task_wakeup (self->data.task);
@@ -422,6 +424,9 @@ hev_socks5_session_udp_splice (HevSocks5Session *base)
     int fd;
 
     LOG_D ("%p socks5 session udp splice", self);
+
+    if (self->data.timeout > 0)
+        hev_socks5_set_timeout (HEV_SOCKS5 (self), self->data.timeout);
 
     /* Datagrams plus room for the socks5 header. */
     size = UDP_BUF_SIZE + 256;

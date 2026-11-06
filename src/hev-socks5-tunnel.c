@@ -60,6 +60,8 @@ enum
 {
     SESSION_UDP,
     SESSION_TCP,
+    /* UDP to the dns-priority resolvers, in a pool of its own. */
+    SESSION_DNS,
     SESSION_TYPES,
 };
 
@@ -182,7 +184,8 @@ hev_socks5_tunnel_evict_session (HevListNode *node)
     sd = container_of (node, HevSocks5SessionData, node);
     hev_list_del (&session_set[sd->type], node);
     hev_socks5_tunnel_mark_evicted (node);
-    session_count--;
+    if (sd->type != SESSION_DNS)
+        session_count--;
     session_type_count[sd->type]--;
     evicted_count++;
     hev_socks5_session_terminate (sd->self);
@@ -210,6 +213,7 @@ hev_socks5_tunnel_oldest_session (void)
  * is replaced, so a storm of new flows cannot kill live connections. A UDP
  * session that got a reply and lived protect-age is replaced only after
  * protect-idle of silence, so a flow with periodic keep-alives survives too.
+ * A query that overflowed the DNS pool is not protected.
  */
 static int
 hev_socks5_tunnel_admit_session (int type)
@@ -241,7 +245,7 @@ hev_socks5_tunnel_admit_session (int type)
         sd = container_of (node, HevSocks5SessionData, node);
         if (now - sd->active_time < min_idle)
             break;
-        if (protect_age && sd->answered &&
+        if (protect_age && sd->answered && !sd->lookup &&
             (now - sd->create_time >= protect_age) &&
             (now - sd->active_time < protect_idle))
             continue;
@@ -255,8 +259,84 @@ hev_socks5_tunnel_admit_session (int type)
     return -1;
 }
 
+/*
+ * A pool session waits while its query has no reply yet, up to the time a
+ * resolver waits before it asks again. One that got a reply to every query is
+ * done: a lookup socket is mostly used once, and a long-lived resolver socket
+ * that asks again later simply gets a new session.
+ */
+static int
+hev_socks5_tunnel_lookup_waiting (HevSocks5SessionData *sd, int64_t now)
+{
+    if (!sd->answered)
+        return now - sd->create_time < DNS_PRIORITY_GRACE_TIME;
+    if (!sd->pending)
+        return 0;
+
+    return now - sd->active_time < DNS_PRIORITY_GRACE_TIME;
+}
+
+/*
+ * Queries to the dns-priority resolvers get a small pool outside the UDP
+ * limits: in a storm of new flows a lookup would otherwise lose to the storm,
+ * and every new connection fails before it starts. A full pool makes room by
+ * closing a session that no longer waits for a reply. While all wait, the new
+ * query does not get in, evicting them would let a flood of queries kill each
+ * one before its reply. It takes the ordinary UDP path then, so a burst of
+ * lookups larger than the pool, as when the tunnel starts, is not dropped
+ * while there is room.
+ */
+static int
+hev_socks5_tunnel_admit_lookup (void)
+{
+    HevListNode *node;
+    int64_t now;
+
+    if (session_type_count[SESSION_DNS] <
+        hev_config_get_misc_dns_priority_sessions ())
+        return 0;
+
+    now = hev_socks5_tunnel_now ();
+    node = hev_list_first (&session_set[SESSION_DNS]);
+    for (; node; node = hev_list_node_next (node)) {
+        HevSocks5SessionData *sd;
+
+        sd = container_of (node, HevSocks5SessionData, node);
+        if (hev_socks5_tunnel_lookup_waiting (sd, now))
+            continue;
+
+        hev_socks5_tunnel_evict_session (node);
+        return 0;
+    }
+
+    LOG_D ("socks5 tunnel dns-priority pool full");
+    return -1;
+}
+
+static int
+hev_socks5_tunnel_is_lookup (const ip_addr_t *addr, u16_t port)
+{
+    const unsigned int *addrs;
+    int i, n;
+
+    if ((port != 53) || !hev_config_get_misc_dns_priority_sessions ())
+        return 0;
+
+    n = hev_config_get_misc_dns_priority_addresses (&addrs);
+    if (n == 0)
+        return 1;
+    if (addr->type != IPADDR_TYPE_V4)
+        return 0;
+
+    for (i = 0; i < n; i++)
+        if (addrs[i] == ip_2_ip4 (addr)->addr)
+            return 1;
+
+    return 0;
+}
+
 static void
-hev_socks5_tunnel_insert_session (HevListNode *node, int type)
+hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
 {
     HevSocks5SessionData *sd;
     int max_session_count;
@@ -266,9 +346,14 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type)
     sd->active_time = sd->create_time;
     sd->type = type;
     sd->answered = 0;
+    sd->pending = 0;
+    sd->lookup = lookup;
+    sd->timeout = lookup ? hev_config_get_misc_dns_priority_timeout () : 0;
 
     hev_list_add_tail (&session_set[type], node);
-    session_count++;
+    /* max-session-count is for UDP and TCP, the pool is not counted. */
+    if (type != SESSION_DNS)
+        session_count++;
     session_type_count[type]++;
 
     max_session_count = hev_config_get_misc_max_session_count ();
@@ -291,7 +376,8 @@ hev_socks5_tunnel_delete_session (HevListNode *node)
 
     sd = container_of (node, HevSocks5SessionData, node);
     hev_list_del (&session_set[sd->type], node);
-    session_count--;
+    if (sd->type != SESSION_DNS)
+        session_count--;
     session_type_count[sd->type]--;
 }
 
@@ -380,7 +466,7 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
-    hev_socks5_tunnel_insert_session (node, SESSION_TCP);
+    hev_socks5_tunnel_insert_session (node, SESSION_TCP, 0);
     hev_task_run (task, hev_socks5_session_task_entry, tcp);
     hev_task_wakeup (task_lwip_timer);
 
@@ -437,6 +523,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevSocks5SessionUDP *udp;
     HevListNode *node;
     HevMappedDNS *dns;
+    int type, lookup;
     int stack_size;
     HevTask *task;
 
@@ -463,7 +550,12 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         return;
     }
 
-    if (hev_socks5_tunnel_admit_session (SESSION_UDP) < 0) {
+    type = SESSION_UDP;
+    lookup = hev_socks5_tunnel_is_lookup (addr, port);
+    if (lookup && (hev_socks5_tunnel_admit_lookup () == 0))
+        type = SESSION_DNS;
+    if ((type == SESSION_UDP) &&
+        (hev_socks5_tunnel_admit_session (SESSION_UDP) < 0)) {
         hev_task_unref (task);
         udp_recv (pcb, udp_drop_handler, NULL);
         return;
@@ -478,7 +570,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
-    hev_socks5_tunnel_insert_session (node, SESSION_UDP);
+    hev_socks5_tunnel_insert_session (node, type, lookup);
     hev_task_run (task, hev_socks5_session_task_entry, udp);
     hev_task_wakeup (task_lwip_timer);
 }
@@ -607,7 +699,7 @@ lwip_timer_task_entry (void *data)
         }
         hev_task_mutex_unlock (&mutex);
 
-        if (session_count || evicted_count)
+        if (session_count || session_type_count[SESSION_DNS] || evicted_count)
             hev_task_sleep (TCP_TMR_INTERVAL);
         else {
 #if defined(__GLIBC__) && !defined(ENABLE_LIBRARY)
@@ -927,7 +1019,8 @@ hev_socks5_tunnel_init (int tun_fd)
 
     session_track = hev_config_get_misc_max_session_count () ||
                     hev_config_get_misc_udp_max_session_count () ||
-                    hev_config_get_misc_tcp_max_session_count ();
+                    hev_config_get_misc_tcp_max_session_count () ||
+                    hev_config_get_misc_dns_priority_sessions ();
 
     res = tunnel_init (tun_fd);
     if (res < 0)
